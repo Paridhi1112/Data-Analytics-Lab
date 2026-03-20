@@ -1,0 +1,293 @@
+
+#  0. Install / load packages 
+pkgs <- c("e1071", "class", "caret", "ggplot2", "reshape2", "gridExtra", "dplyr")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  library(p, character.only = TRUE)
+}
+
+set.seed(42)
+
+#  1. Load Data 
+col_names <- c("Class", "Alcohol", "Malic_acid", "Ash", "Alcalinity_ash",
+               "Magnesium", "Total_phenols", "Flavanoids", "Nonflavanoid_phenols",
+               "Proanthocyanins", "Color_intensity", "Hue", "OD280_OD315", "Proline")
+
+wine <- read.csv("wine.data", header = FALSE, col.names = col_names)
+wine$Class <- as.factor(wine$Class)
+
+cat("── Dataset Overview \n")
+print(str(wine))
+print(table(wine$Class))
+
+# ── 2. Feature Selection (by |correlation| with numeric Class) 
+num_class  <- as.numeric(wine$Class)
+feat_names <- col_names[-1]                          # all 13 predictors
+cors       <- sapply(feat_names, function(f) abs(cor(wine[[f]], num_class)))
+cors_sorted <- sort(cors, decreasing = TRUE)
+
+cat("\n── Absolute correlations with Class \n")
+print(round(cors_sorted, 3))
+
+# Keep top 7 features
+top_features <- names(cors_sorted)[1:7]
+cat("\nSelected features:", paste(top_features, collapse = ", "), "\n")
+
+# ── 3. Train / Test Split (75 / 25, stratified) 
+train_idx <- createDataPartition(wine$Class, p = 0.75, list = FALSE)
+train_raw <- wine[train_idx,  c("Class", top_features)]
+test_raw  <- wine[-train_idx, c("Class", top_features)]
+
+# Scale features (fit on train, apply to both)
+pre_proc   <- preProcess(train_raw[, top_features], method = c("center", "scale"))
+train_sc   <- predict(pre_proc, train_raw)
+test_sc    <- predict(pre_proc, test_raw)
+
+X_train <- train_sc[, top_features]
+y_train <- train_sc$Class
+X_test  <- test_sc[, top_features]
+y_test  <- test_sc$Class
+
+cat(sprintf("\nTrain: %d rows | Test: %d rows\n", nrow(train_sc), nrow(test_sc)))
+
+# ── 4. tune.svm – Linear SVM 
+cat("\n── Tuning Linear SVM (tune.svm) \n")
+tune_linear <- tune.svm(
+  Class ~ .,
+  data   = train_sc,
+  kernel = "linear",
+  cost   = c(0.001, 0.01, 0.1, 1, 10, 100),
+  tunecontrol = tune.control(cross = 5)
+)
+print(summary(tune_linear))
+
+best_C_linear <- tune_linear$best.parameters$cost
+cat(sprintf("Best C (linear): %.4f\n", best_C_linear))
+
+svm_linear <- svm(Class ~ ., data = train_sc,
+                  kernel = "linear", cost = best_C_linear,
+                  scale = FALSE)         
+
+# ── 5. tune.svm – RBF SVM 
+cat("\n── Tuning RBF SVM (tune.svm) \n")
+tune_rbf <- tune.svm(
+  Class ~ .,
+  data   = train_sc,
+  kernel = "radial",
+  cost   = c(0.1, 1, 10, 100),
+  gamma  = c(0.001, 0.01, 0.1, 1),
+  tunecontrol = tune.control(cross = 5)
+)
+print(summary(tune_rbf))
+
+best_C_rbf    <- tune_rbf$best.parameters$cost
+best_gamma    <- tune_rbf$best.parameters$gamma
+cat(sprintf("Best C (RBF): %.4f | Best gamma: %.4f\n", best_C_rbf, best_gamma))
+
+svm_rbf <- svm(Class ~ ., data = train_sc,
+               kernel = "radial",
+               cost  = best_C_rbf,
+               gamma = best_gamma,
+               scale = FALSE)
+
+# ── 6. kNN – tune k (1–20) via 5-fold CV 
+cat("\n── Tuning kNN (k = 1–20) \n")
+ctrl <- trainControl(method = "cv", number = 5)
+knn_tune <- train(Class ~ ., data = train_sc,
+                  method    = "knn",
+                  trControl = ctrl,
+                  tuneGrid  = data.frame(k = 1:20))
+best_k <- knn_tune$bestTune$k
+cat(sprintf("Best k: %d | CV Accuracy: %.4f\n",
+            best_k, max(knn_tune$results$Accuracy)))
+
+# ── 7. Predictions & Performance Metrics
+predict_metrics <- function(model_name, y_true, y_pred) {
+  cm  <- confusionMatrix(y_pred, y_true)
+  prec   <- cm$byClass[, "Precision"]
+  rec    <- cm$byClass[, "Recall"]
+  f1     <- cm$byClass[, "F1"]
+  w      <- as.numeric(table(y_true)) / length(y_true)  # class weights
+  
+  cat(sprintf("\n══ %s \n", model_name))
+  cat("Confusion Matrix:\n"); print(cm$table)
+  cat(sprintf("\nWeighted Precision : %.4f\n", sum(prec * w, na.rm = TRUE)))
+  cat(sprintf("Weighted Recall    : %.4f\n",   sum(rec  * w, na.rm = TRUE)))
+  cat(sprintf("Weighted F1        : %.4f\n",   sum(f1   * w, na.rm = TRUE)))
+  cat("\nPer-class breakdown:\n")
+  print(round(data.frame(Precision = prec, Recall = rec, F1 = f1), 4))
+  
+  list(name = model_name, cm = cm$table,
+       prec = sum(prec * w, na.rm = TRUE),
+       rec  = sum(rec  * w, na.rm = TRUE),
+       f1   = sum(f1   * w, na.rm = TRUE),
+       per_class_f1 = f1)
+}
+
+pred_linear <- predict(svm_linear, newdata = test_sc)
+pred_rbf    <- predict(svm_rbf,    newdata = test_sc)
+pred_knn    <- predict(knn_tune,   newdata = test_sc)
+
+res_linear <- predict_metrics("SVM (Linear)", y_test, pred_linear)
+res_rbf    <- predict_metrics("SVM (RBF)",    y_test, pred_rbf)
+res_knn    <- predict_metrics("kNN",          y_test, pred_knn)
+
+# ── 8. Summary Table 
+summary_tbl <- data.frame(
+  Model     = c("SVM (Linear)", "SVM (RBF)", "kNN"),
+  Precision = round(c(res_linear$prec, res_rbf$prec, res_knn$prec), 4),
+  Recall    = round(c(res_linear$rec,  res_rbf$rec,  res_knn$rec),  4),
+  F1        = round(c(res_linear$f1,   res_rbf$f1,   res_knn$f1),   4)
+)
+cat("\n── Model Comparison\n")
+print(summary_tbl)
+
+# ── 9. Plots 
+
+## (A) Feature Correlation Bar Chart
+cor_df <- data.frame(
+  Feature     = names(cors_sorted),
+  Correlation = cors_sorted,
+  Selected    = names(cors_sorted) %in% top_features
+)
+cor_df$Feature <- factor(cor_df$Feature, levels = rev(names(cors_sorted)))
+
+p_corr <- ggplot(cor_df, aes(x = Feature, y = Correlation, fill = Selected)) +
+  geom_bar(stat = "identity", colour = "white", width = 0.75) +
+  scale_fill_manual(values = c("TRUE" = "#2E86AB", "FALSE" = "#CCCCCC"),
+                    labels = c("TRUE" = "Selected", "FALSE" = "Not selected")) +
+  geom_hline(yintercept = cors_sorted[7], linetype = "dashed",
+             colour = "#E84855", linewidth = 0.8) +
+  coord_flip() +
+  labs(title = "Feature Selection",
+       subtitle = "Top 7 features (blue) chosen by |correlation| with Class",
+       x = NULL, y = "|Correlation with Class|", fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold"))
+
+## (B) Helper: ggplot confusion matrix
+plot_cm <- function(cm_table, title) {
+  cm_df <- as.data.frame(cm_table)
+  names(cm_df) <- c("Predicted", "True", "Freq")
+  ggplot(cm_df, aes(x = Predicted, y = True, fill = Freq)) +
+    geom_tile(colour = "white", linewidth = 0.8) +
+    geom_text(aes(label = Freq), size = 5, fontface = "bold", colour = "white") +
+    scale_fill_gradient(low = "#AED9E0", high = "#1B4965") +
+    labs(title = title, x = "Predicted", y = "True") +
+    theme_minimal(base_size = 10) +
+    theme(legend.position = "none",
+          plot.title = element_text(face = "bold", size = 11),
+          axis.text  = element_text(size = 10))
+}
+
+p_cm1 <- plot_cm(res_linear$cm, "Confusion Matrix\nSVM (Linear)")
+p_cm2 <- plot_cm(res_rbf$cm,    "Confusion Matrix\nSVM (RBF)")
+p_cm3 <- plot_cm(res_knn$cm,    "Confusion Matrix\nkNN")
+
+## (C) Overall metric comparison bar chart
+bar_df <- reshape2::melt(summary_tbl, id.vars = "Model",
+                         variable.name = "Metric", value.name = "Score")
+
+p_metrics <- ggplot(bar_df, aes(x = Model, y = Score, fill = Metric)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.75),
+           width = 0.65, colour = "white") +
+  geom_text(aes(label = sprintf("%.3f", Score)),
+            position = position_dodge(width = 0.75),
+            vjust = -0.4, size = 3.2, fontface = "bold") +
+  scale_fill_manual(values = c(Precision = "#2E86AB",
+                               Recall    = "#E84855",
+                               F1        = "#3BB273")) +
+  coord_cartesian(ylim = c(0.80, 1.05)) +
+  labs(title = "Overall Model Performance (Weighted Avg.)",
+       x = NULL, y = "Score", fill = "Metric") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title    = element_text(face = "bold"),
+        legend.position = "bottom")
+
+## (D) Per-class F1 heatmap
+pc_f1 <- data.frame(
+  Class = c("Class 1", "Class 2", "Class 3"),
+  `SVM (Linear)` = res_linear$per_class_f1,
+  `SVM (RBF)`    = res_rbf$per_class_f1,
+  `kNN`          = res_knn$per_class_f1,
+  check.names = FALSE
+)
+pc_melt <- reshape2::melt(pc_f1, id.vars = "Class",
+                          variable.name = "Model", value.name = "F1")
+
+p_perclass <- ggplot(pc_melt, aes(x = Model, y = Class, fill = F1)) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_text(aes(label = sprintf("%.3f", F1)),
+            size = 4.5, fontface = "bold", colour = "white") +
+  scale_fill_gradient(low = "#FFC857", high = "#C1292E", limits = c(0.75, 1.0)) +
+  labs(title = "Per-Class F1 Score", x = NULL, y = NULL, fill = "F1") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text  = element_text(size = 11))
+
+## (E) Linear SVM – C tuning curve
+c_results <- tune_linear$performances
+p_ctune <- ggplot(c_results, aes(x = cost, y = 1 - error)) +
+  geom_line(colour = "#2E86AB", linewidth = 1.2) +
+  geom_point(colour = "#2E86AB", size = 3) +
+  geom_point(data = c_results[which.min(c_results$error), ],
+             aes(x = cost, y = 1 - error),
+             colour = "#E84855", size = 5, shape = 8, stroke = 2) +
+  scale_x_log10() +
+  labs(title = "Linear SVM: C Tuning",
+       subtitle = sprintf("Best C = %g", best_C_linear),
+       x = "C (log scale)", y = "CV Accuracy") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+## (F) RBF SVM – C × gamma heatmap
+rbf_perf <- tune_rbf$performances
+rbf_perf$Accuracy <- 1 - rbf_perf$error
+rbf_perf$gamma    <- as.factor(rbf_perf$gamma)
+rbf_perf$cost     <- as.factor(rbf_perf$cost)
+
+p_rbftune <- ggplot(rbf_perf, aes(x = gamma, y = cost, fill = Accuracy)) +
+  geom_tile(colour = "white", linewidth = 0.8) +
+  geom_text(aes(label = sprintf("%.3f", Accuracy)),
+            size = 3.5, colour = "white", fontface = "bold") +
+  scale_fill_gradient(low = "#AED9E0", high = "#1B4965") +
+  labs(title = "RBF SVM: C × gamma Tuning",
+       subtitle = sprintf("Best C = %g, gamma = %g", best_C_rbf, best_gamma),
+       x = "gamma", y = "C", fill = "CV Acc") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+## (G) kNN – k tuning
+knn_res <- knn_tune$results
+p_ktune <- ggplot(knn_res, aes(x = k, y = Accuracy)) +
+  geom_line(colour = "#3BB273", linewidth = 1.2) +
+  geom_point(colour = "#3BB273", size = 3) +
+  geom_point(data = knn_res[knn_res$k == best_k, ],
+             aes(x = k, y = Accuracy),
+             colour = "#E84855", size = 5, shape = 8, stroke = 2) +
+  labs(title = "kNN: k Tuning",
+       subtitle = sprintf("Best k = %d", best_k),
+       x = "k (number of neighbours)", y = "CV Accuracy") +
+  scale_x_continuous(breaks = seq(1, 20, 2)) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+#
+png("wine_classification_results.png", width = 1800, height = 2000, res = 130)
+
+gridExtra::grid.arrange(
+  p_corr,
+  gridExtra::arrangeGrob(p_cm1, p_cm2, p_cm3, ncol = 3),
+  gridExtra::arrangeGrob(p_metrics, p_perclass, ncol = 2),
+  gridExtra::arrangeGrob(p_ctune, p_rbftune, p_ktune, ncol = 3),
+  nrow   = 4,
+  heights = c(1.2, 1.1, 1.1, 1.1),
+  top    = grid::textGrob(
+    "Wine Classification: SVM (Linear & RBF) vs kNN",
+    gp = grid::gpar(fontsize = 16, fontface = "bold")
+  )
+)
+
+dev.off()
+cat("\nPlot saved to wine_classification_results.png\n")
